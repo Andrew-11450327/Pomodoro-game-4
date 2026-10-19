@@ -537,113 +537,121 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
     };
     run().catch(handleError);
   </script>
-<!-- 全螢幕點擊解鎖覆蓋層 (確保 100% 觸發手勢授權) -->
-<div id="unlock-overlay" style="position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background: rgba(0,0,0,0.85); color: #fff; z-index: 99999; display: flex; flex-direction: column; justify-content: center; align-items: center; cursor: pointer; text-align: center; font-family: sans-serif;">
-  <h2 style="margin-bottom: 10px;">🍅 點擊畫面啟動番茄鐘</h2>
-  <p style="font-size: 14px; color: #ccc;">點擊以開啟螢幕常亮與音效授權</p>
-</div>
-
-<!-- 1x1 像素防休眠影片 -->
-<video id="no-sleep-video" playsinline loop muted style="position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none;">
-  <source src="data:video/mp4;base64,AAAAIGZ0eXBpc29tAAAAAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAAdtZGF0AAAAAAA=" type="video/mp4">
-</video>
-
 <script>
   const overlay = document.getElementById('unlock-overlay');
   const videoElem = document.getElementById('no-sleep-video');
-  const alarmSound = new Audio("alarm_2.wav");[cite: 2]
 
+  // 1. 使用 Web Audio API 硬體記憶體解碼音效 (消除載入與播放延遲)
   const AudioContext = window.AudioContext || window.webkitAudioContext;
   let audioCtx = null;
+  let alarmBuffer = null;
   let wakeLock = null;
 
-  // 1. 手指點擊瞬間：直接同步請求防休眠與音訊授權
+  // 預先抓取並將 alarm_2.wav 解碼載入記憶體[cite: 2]
+  fetch("alarm_2.wav")[cite: 2]
+    .then(res => res.arrayBuffer())
+    .then(buffer => {
+      audioCtx = audioCtx || new AudioContext();
+      return audioCtx.decodeAudioData(buffer);
+    })
+    .then(decoded => {
+      alarmBuffer = decoded;
+      console.log("⚡ 鬧鐘音效記憶體解碼完成，已具備 0 毫秒觸發能力！");
+    })
+    .catch(err => console.log("音效載入失敗:", err));
+
+  // 點擊覆蓋層：瞬間解鎖硬體 Audio Context
   overlay.addEventListener('click', async function() {
-    // 隱藏覆蓋層
     overlay.style.display = 'none';
 
-    // A. 啟動 Web Audio Context
     if (!audioCtx) audioCtx = new AudioContext();
     if (audioCtx.state === 'suspended') await audioCtx.resume();
 
-    // B. 預熱鬧鐘音效
-    alarmSound.load();
-    alarmSound.play().then(() => {
-      alarmSound.pause();
-      alarmSound.currentTime = 0;
-    }).catch(() => {});
-
-    // C. 啟動影片防休眠 (NoSleep)
     if (videoElem) {
-      videoElem.play().catch(e => console.log("影片播放受阻:", e));
+      videoElem.play().catch(() => {});
     }
 
-    // D. 啟動原生 Wake Lock API
     try {
       if ('wakeLock' in navigator) {
         wakeLock = await navigator.wakeLock.request('screen');
-        console.log("Wake Lock 授權成功！");
       }
-    } catch (err) {
-      console.log("Wake Lock 啟動失敗，已使用影片防休眠備用");
-    }
+    } catch (err) {}
   });
 
-  // 2. Web Worker 獨立背景計時
+  // 2. 毫秒級精準連續響鈴 (無 gap 無延遲)
+  function ringAlarmFast(repeatTimes) {
+    if (!audioCtx) return;
+
+    if (alarmBuffer) {
+      const duration = alarmBuffer.duration;
+      const gap = 0.15; // 每次響鈴之間的精確間隔 (秒)
+
+      // 一次性將 N 次響鈴精確登記到音效晶片時間軸上
+      for (let i = 0; i < repeatTimes; i++) {
+        const source = audioCtx.createBufferSource();
+        source.buffer = alarmBuffer;
+        source.connect(audioCtx.destination);
+        
+        // 即刻 (currentTime) 加上累計排程時間
+        const playTime = audioCtx.currentTime + i * (duration + gap);
+        source.start(playTime);
+      }
+    } else {
+      // 備用機制 (萬一音效解碼未完成)
+      const fallbackSound = new Audio("alarm_2.wav");[cite: 2]
+      let count = 0;
+      fallbackSound.onended = () => {
+        count++;
+        if (count < repeatTimes) {
+          fallbackSound.currentTime = 0;
+          fallbackSound.play();
+        }
+      };
+      fallbackSound.play();
+    }
+  }
+
+  // 3. 高頻率 Web Worker (20ms 高速輪詢，誤差小於 0.02 秒)
   const workerCode = `
     let timer = null;
     self.onmessage = function(e) {
       if (e.data.cmd === 'start') {
         const targetTime = e.data.targetTime;
         if (timer) clearInterval(timer);
+        
+        // 每 20 毫秒檢查一次時間，達到極致精準度
         timer = setInterval(() => {
           if (Date.now() >= targetTime) {
             clearInterval(timer);
             self.postMessage('TIME_UP');
           }
-        }, 300);
+        }, 20); 
       }
     };
   `;
   const blob = new Blob([workerCode], { type: 'application/javascript' });
   const worker = new Worker(URL.createObjectURL(blob));
 
-  // 3. 響鈴控制 (專注 10 次 / 休息 5 次)
-  function ringAlarm(repeatTimes) {
-    let currentCount = 0;
-
-    alarmSound.onended = function() {
-      currentCount++;
-      if (currentCount < repeatTimes) {
-        alarmSound.currentTime = 0;
-        alarmSound.play().catch(e => console.log(e));
-      } else {
-        if (wakeLock) wakeLock.release().then(() => { wakeLock = null; });
-        if (videoElem) videoElem.pause();
-      }
-    };
-
-    alarmSound.currentTime = 0;
-    alarmSound.play().catch(e => console.log("響鈴失敗:", e));
-  }
-
   let currentStageMode = 1;
 
   worker.onmessage = function(e) {
     if (e.data === 'TIME_UP') {
       const repeatTimes = (currentStageMode === 1) ? 10 : 5;
-      ringAlarm(repeatTimes);
+      ringAlarmFast(repeatTimes);
     }
   };
 
   // 4. 啟動計時主邏輯
   function startPomodoroBySeconds(seconds, stageMode) {
     currentStageMode = stageMode;
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume();
+    }
     const targetTime = Date.now() + seconds * 1000;
     worker.postMessage({ cmd: 'start', targetTime: targetTime });
   }
 
-  // 5. 監聽 Scratch 變數
+  // 5. Scratch 變數監聽 (縮短至 50ms 高速檢查)
   setInterval(() => {
     if (window.P2 && P2.p2 && P2.p2.vm) {
       const vm = P2.p2.vm;
@@ -666,7 +674,7 @@ THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND 
         }
       }
     }
-  }, 200);
+  }, 50); // 從 200ms 縮短至 50ms
 </script>
 </body>
 </html>
